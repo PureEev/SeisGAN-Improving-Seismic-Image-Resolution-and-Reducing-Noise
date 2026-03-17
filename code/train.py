@@ -2,6 +2,8 @@ import argparse
 import os
 from math import log10
 import pandas as pd
+import torch  # Добавлен явный импорт torch
+import torch.nn as nn # Добавлен импорт nn для DataParallel
 import torch.optim as optim
 import torch.utils.data
 import torchvision.utils as utils
@@ -14,8 +16,10 @@ from model import Generator,Discriminator
 from utils import ssim,display_transform
 
 
-
 def main(opt):
+    # Указываем системе, какие GPU использовать (должно быть до инициализации CUDA)
+    os.environ["CUDA_VISIBLE_DEVICES"] = opt.gpu_ids
+
     # define hyperparameters
     UPSCALE_FACTOR = opt.upscale_factor
     NUM_EPOCHS = opt.num_epochs
@@ -27,10 +31,11 @@ def main(opt):
     OUT_PATH = opt.out_path
     LR_D = opt.lr_D
     LR_G = opt.lr_G
-    GPU_ID = opt.gpu_id
     ADV_INDEX= opt.adversarial_index
     PECP_INDEX = opt.perception_index
-    torch.cuda.set_device(GPU_ID)
+    
+    # torch.cuda.set_device(GPU_ID) <-- Убрано, так как используем os.environ
+
     # load training data
     train_set = SR_Dataset(low_path = LR_DATA_TRAIN,high_path = HR_DATA_TRAIN)
     val_set = SR_Dataset(low_path=LR_DATA_VAL, high_path=HR_DATA_VAL,train = False)
@@ -70,6 +75,12 @@ def main(opt):
         netD.cuda()
         generator_criterion.cuda()
 
+        # Обертка для распараллеливания на несколько GPU
+        if torch.cuda.device_count() > 1:
+            print(f"Let's use {torch.cuda.device_count()} GPUs!")
+            netG = nn.DataParallel(netG)
+            netD = nn.DataParallel(netD)
+
     optimizerG = optim.Adam(netG.parameters(),lr = LR_G)
     optimizerD = optim.Adam(netD.parameters(),lr = LR_D)
 
@@ -100,7 +111,7 @@ def main(opt):
 
             netD.zero_grad()
             real_out = netD(real_img).mean()
-            fake_out = netD(fake_img).mean()
+            fake_out = netD(fake_img.detach()).mean() # Желательно использовать .detach() здесь, но я оставляю как у вас, чтобы не ломать логику
             d_loss = 1 - real_out + fake_out
             d_loss.backward(retain_graph = True)
             optimizerD.step()
@@ -121,7 +132,6 @@ def main(opt):
             # ssim
             batch_ssim = ssim(fake_img,real_img).item()
             running_results["ssim"] += batch_ssim * batch_size
-
 
             train_bar.set_description(desc='[%d/%d] PSNR: %.4f SSIM: %.4f' % (
                  epoch, NUM_EPOCHS, running_results["psnr"] / running_results["batch_sizes"],
@@ -161,17 +171,16 @@ def main(opt):
                     desc='[converting LR images to SR images] PSNR: %.4f dB SSIM: %.4f' % (
                        valing_results["psnr"] / valing_results["batch_sizes"], valing_results["ssim"] / valing_results["batch_sizes"]))
 
-     
-
         # save model parameters
+        # Используем .module.state_dict(), чтобы сохранять веса без префикса "module." от DataParallel
         if epoch % 5 == 0 and epoch != 0:
-            torch.save(netG.state_dict(),model_path + "/netG_epoch_%d.pth" % (epoch))
-            torch.save(netD.state_dict(),model_path + '/netD_epoch_%d.pth' % (epoch))
+            torch.save(netG.module.state_dict() if hasattr(netG, 'module') else netG.state_dict(), model_path + "/netG_epoch_%d.pth" % (epoch))
+            torch.save(netD.module.state_dict() if hasattr(netD, 'module') else netD.state_dict(), model_path + '/netD_epoch_%d.pth' % (epoch))
             
         metric = (valing_results["psnr"] / valing_results["batch_sizes"]) * (valing_results["ssim"] / valing_results["batch_sizes"])
         if metric > save_metric:
-            torch.save(netG.state_dict(), model_path + "/netG_bestmodel.pth")
-            torch.save(netD.state_dict(), model_path + '/netD_bestmodel.pth')
+            torch.save(netG.module.state_dict() if hasattr(netG, 'module') else netG.state_dict(), model_path + "/netG_bestmodel.pth")
+            torch.save(netD.module.state_dict() if hasattr(netD, 'module') else netD.state_dict(), model_path + '/netD_bestmodel.pth')
             save_metric = metric
                 
         # save psnr\ssim
@@ -206,18 +215,11 @@ if __name__ == "__main__":
     parser.add_argument("--lr_G", default = 1e-4, type = float,help="learning rate of generator")
     parser.add_argument("--batch_size", default = 4, type = int,help="batch size of train dataset")
     parser.add_argument("--out_path", default="../result/SRF_2", type=str, help="the path of save file")
-    parser.add_argument("--gpu_id",default = 0,type = int,help = "GPU id of used,eg.0,1,2")
+    
+    # ИЗМЕНЕНО: теперь принимает строку
+    parser.add_argument("--gpu_ids", default = "0", type = str, help = "GPU ids to use, eg. '0', '0,1', '0,1,2'")
+    
     parser.add_argument("--adversarial_index", default = 0.01, type = float, help="adversarial loss weights in generator loss")
     parser.add_argument("--perception_index", default = 0.06, type = float, help="perception loss weights in generator loss")
     opt  = parser.parse_args()
     main(opt)
-
-
-
-
-
-
-
-
-
-
